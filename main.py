@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 app = FastAPI()
 
-# Request schema
+# Request contract
 class Message(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -19,6 +19,26 @@ class ChatRequest(BaseModel):
 
     model: str = Field(min_length=1)
     messages: list[Message] = Field(min_length=1)
+
+# Client-facing response contract
+class AssistantMessage(BaseModel):
+    role: Literal["assistant"] = "assistant"
+    content: str = Field(min_length=1)
+
+
+class CompletionChoice(BaseModel):
+    index: int = Field(ge=0)
+    message: AssistantMessage
+    finish_reason: Literal["stop"]
+
+
+class ChatResponse(BaseModel):
+    id: str = Field(min_length=1)
+    object: Literal["chat.completion"]
+    created: int = Field(ge=0)
+    model: str = Field(min_length=1)
+    choices: list[CompletionChoice] = Field(min_length=1)
+
 
 # simulated provider implementations
 def mock_provider_a(messages: list[Message]) -> str:
@@ -42,37 +62,50 @@ MODEL_ROUTES = {
     "mock-model-b": "provider-b",
 }
 
+# Provider output boundary
+def validate_provider_output(raw_output: object) -> str:
+    if not isinstance(raw_output, str) or not raw_output.strip():
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid provider response",
+        )
+
+    return raw_output
+
+
 # Gateway endpoint
-@app.post("/v1/chat/completions")
-def chat_completions(request: ChatRequest):
+@app.post("/v1/chat/completions", response_model=ChatResponse,)
+def chat_completions(request: ChatRequest) -> ChatResponse:
     provider_name = MODEL_ROUTES.get(request.model)
+
     if provider_name is None:
         raise HTTPException(
             status_code=404,
             detail="Model not found"
         )
     provider = PROVIDERS.get(provider_name)
+
     if provider is None:
         raise HTTPException(
             status_code=503,
             detail="Configured provider unavailable",
         )
 
-    completion_text = provider(request.messages)
+    raw_output = provider(request.messages)
+    completion_text = validate_provider_output(raw_output)
 
-    return {
-        "id": "chatcmpl-mock",
-        "object": "chat.completion",
-        "created": 0,
-        "model": request.model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": completion_text,
-                },
-                "finish_reason": "stop",
-            }
+    return ChatResponse(
+        id="chatcmpl-mock",
+        object="chat.completion",
+        created=0,
+        model=request.model,
+        choices=[
+            CompletionChoice(
+                index=0,
+                message=AssistantMessage(
+                    content=completion_text,
+                ),
+                finish_reason="stop",
+            )
         ],
-    }
+    )
