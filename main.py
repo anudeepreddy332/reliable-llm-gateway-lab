@@ -2,6 +2,9 @@ from typing import Callable, Literal
 from enum import Enum
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
+import os
+import httpx
+from providers import deepseek
 
 
 app = FastAPI()
@@ -82,18 +85,87 @@ def mock_provider_b(messages: list[Message]) -> str:
     return f"Mock B received: {messages[-1].content}"
 
 
+def deepseek_provider(messages: list[Message]) -> str:
+    if os.getenv("GATEWAY_ENABLE_LIVE_PROVIDER") != "1":
+        raise HTTPException(
+            status_code=503,
+            detail="Live provider access disabled",
+        )
+
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="DeepSeek provider not configured",
+        )
+
+    provider_messages = [
+        {"role": message.role, "content": message.content}
+        for message in messages
+    ]
+
+    try:
+        with deepseek.create_client() as client:
+            return deepseek.complete(
+                provider_messages,
+                api_key,
+                client=client,
+            )
+
+    except httpx.TimeoutException as exc:
+        raise ProviderExecutionError(
+            ProviderFailureKind.TIMEOUT,
+            "DeepSeek request timed out",
+        ) from exc
+
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+
+        if status == 429:
+            kind = ProviderFailureKind.RATE_LIMIT
+        elif status in (408, 504):
+            kind = ProviderFailureKind.TIMEOUT
+        elif status in (500, 502, 503):
+            kind = ProviderFailureKind.UNAVAILABLE
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail="Upstream provider request rejected",
+            ) from exc
+
+        raise ProviderExecutionError(
+            kind,
+            "DeepSeek upstream HTTP failure",
+        ) from exc
+
+    except httpx.RequestError as exc:
+        raise ProviderExecutionError(
+            ProviderFailureKind.CONNECTION,
+            "DeepSeek transport failure",
+        ) from exc
+
+    except deepseek.DeepSeekResponseError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid provider response",
+        ) from exc
+
+
 # provider registry
 ProviderFunction = Callable[[list[Message]], str]
 
 PROVIDERS: dict[str, ProviderFunction] = {
     "provider-a": mock_provider_a,
     "provider-b": mock_provider_b,
+    "deepseek": deepseek_provider,
 }
 
 # Model routing config
 MODEL_ROUTES: dict[str, str] = {
     "mock-model": "provider-a",
     "mock-model-b": "provider-b",
+    "deepseek-flash": "deepseek",
 }
 
 # Provider output boundary
