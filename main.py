@@ -1,5 +1,5 @@
 from typing import Callable, Literal
-
+from enum import Enum
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -39,6 +39,40 @@ class ChatResponse(BaseModel):
     model: str = Field(min_length=1)
     choices: list[CompletionChoice] = Field(min_length=1)
 
+# Provider failure classification
+class ProviderFailureKind(str, Enum):
+    RATE_LIMIT = "rate_limit"
+    UNAVAILABLE = "unavailable"
+    TIMEOUT = "timeout"
+    CONNECTION = "connection"
+
+class ProviderExecutionError(Exception):
+    def __init__(
+        self,
+        kind: ProviderFailureKind,
+        message: str,
+    ) -> None:
+        self.kind = kind
+        super().__init__(message)
+
+
+PROVIDER_FAILURE_HTTP: dict[
+    ProviderFailureKind, tuple[int, str]
+] = {
+    ProviderFailureKind.RATE_LIMIT: (
+        429, "Upstream provider rate limited"
+    ),
+    ProviderFailureKind.UNAVAILABLE: (
+        503, "Upstream provider unavailable"
+    ),
+    ProviderFailureKind.TIMEOUT: (
+        504, "Upstream provider timed out"
+    ),
+    ProviderFailureKind.CONNECTION: (
+        502, "Upstream connection failed"
+    ),
+}
+
 
 # simulated provider implementations
 def mock_provider_a(messages: list[Message]) -> str:
@@ -57,7 +91,7 @@ PROVIDERS: dict[str, ProviderFunction] = {
 }
 
 # Model routing config
-MODEL_ROUTES = {
+MODEL_ROUTES: dict[str, str] = {
     "mock-model": "provider-a",
     "mock-model-b": "provider-b",
 }
@@ -90,8 +124,18 @@ def chat_completions(request: ChatRequest) -> ChatResponse:
             status_code=503,
             detail="Configured provider unavailable",
         )
+    try:
 
-    raw_output = provider(request.messages)
+        raw_output = provider(request.messages)
+
+    except ProviderExecutionError as exc:
+        status_code, detail = PROVIDER_FAILURE_HTTP[exc.kind]
+
+        raise HTTPException(
+            status_code=status_code,
+            detail=detail,
+        ) from exc
+
     completion_text = validate_provider_output(raw_output)
 
     return ChatResponse(
