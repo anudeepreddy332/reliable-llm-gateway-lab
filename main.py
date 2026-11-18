@@ -5,6 +5,8 @@ from pydantic import BaseModel, ConfigDict, Field
 import os
 import httpx
 from providers import deepseek, cohere
+from functools import partial
+from reliability import ProviderAttempt, execute_plan
 
 
 app = FastAPI()
@@ -238,6 +240,12 @@ MODEL_ROUTES: dict[str, str] = {
     "cohere-command-r7b": "cohere",
 }
 
+# Explicit fallback routes.
+# No automatic real-provider fallback is enabled.
+FALLBACK_ROUTES: dict[str, tuple[str, ...]] = {
+    "mock-fallback": ("provider-a", "provider-b"),
+}
+
 # Provider output boundary
 def validate_provider_output(raw_output: object) -> str:
     if not isinstance(raw_output, str) or not raw_output.strip():
@@ -249,26 +257,66 @@ def validate_provider_output(raw_output: object) -> str:
     return raw_output
 
 
+def invoke_validated(
+    provider: ProviderFunction,
+    messages: list[Message],
+) -> str:
+    raw_output = provider(messages)
+    return validate_provider_output(raw_output)
+
+def can_failover(exc: Exception) -> bool:
+    return (
+        isinstance(exc, ProviderExecutionError)
+        and exc.kind in {
+            ProviderFailureKind.RATE_LIMIT,
+            ProviderFailureKind.UNAVAILABLE,
+        }
+    )
+
 # Gateway endpoint
 @app.post("/v1/chat/completions", response_model=ChatResponse,)
 def chat_completions(request: ChatRequest) -> ChatResponse:
-    provider_name = MODEL_ROUTES.get(request.model)
+    provider_names = FALLBACK_ROUTES.get(request.model)
 
-    if provider_name is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Model not found"
-        )
-    provider = PROVIDERS.get(provider_name)
+    if provider_names is None:
+        primary_name = MODEL_ROUTES.get(request.model)
 
-    if provider is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Configured provider unavailable",
+        if primary_name is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Model not found"
+            )
+
+        provider_names = (primary_name,)
+
+    attempts: list[ProviderAttempt] = []
+
+    for provider_name in provider_names:
+        provider = PROVIDERS.get(provider_name)
+
+        if provider is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Configured provider unavailable",
+            )
+
+        attempts.append(
+            ProviderAttempt(
+                name=provider_name,
+                execute=partial(
+                    invoke_validated,
+                    provider,
+                    request.messages,
+                ),
+            )
         )
+
     try:
-
-        raw_output = provider(request.messages)
+        result = execute_plan(
+            tuple(attempts),
+            can_failover=can_failover,
+            max_attempts=2,
+        )
 
     except ProviderExecutionError as exc:
         status_code, detail = PROVIDER_FAILURE_HTTP[exc.kind]
@@ -277,8 +325,6 @@ def chat_completions(request: ChatRequest) -> ChatResponse:
             status_code=status_code,
             detail=detail,
         ) from exc
-
-    completion_text = validate_provider_output(raw_output)
 
     return ChatResponse(
         id="chatcmpl-mock",
@@ -289,7 +335,7 @@ def chat_completions(request: ChatRequest) -> ChatResponse:
             CompletionChoice(
                 index=0,
                 message=AssistantMessage(
-                    content=completion_text,
+                    content=result.content,
                 ),
                 finish_reason="stop",
             )
