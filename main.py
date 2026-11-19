@@ -6,7 +6,8 @@ import os
 import httpx
 from providers import deepseek, cohere
 from functools import partial
-from reliability import ProviderAttempt, execute_plan
+from reliability import ProviderAttempt, execute_plan, DeadlineExceeded
+from dataclasses import dataclass
 
 
 app = FastAPI()
@@ -87,7 +88,10 @@ def mock_provider_b(messages: list[Message]) -> str:
     return f"Mock B received: {messages[-1].content}"
 
 
-def deepseek_provider(messages: list[Message]) -> str:
+def deepseek_provider(messages: list[Message],
+                      *,
+                      timeout_seconds: float | None = None,
+                      ) -> str:
     if os.getenv("GATEWAY_ENABLE_LIVE_PROVIDER") != "1":
         raise HTTPException(
             status_code=503,
@@ -113,6 +117,7 @@ def deepseek_provider(messages: list[Message]) -> str:
                 provider_messages,
                 api_key,
                 client=client,
+                timeout_seconds=timeout_seconds,
             )
 
     except httpx.TimeoutException as exc:
@@ -155,7 +160,9 @@ def deepseek_provider(messages: list[Message]) -> str:
 
 
 # Cohere provider
-def cohere_provider(messages: list[Message]) -> str:
+def cohere_provider(messages: list[Message],
+                    *,
+                    timeout_seconds: float | None = None,) -> str:
     if os.getenv("GATEWAY_ENABLE_LIVE_PROVIDER") != "1":
         raise HTTPException(
             status_code=503,
@@ -181,6 +188,7 @@ def cohere_provider(messages: list[Message]) -> str:
                 provider_messages,
                 api_key,
                 client=client,
+                timeout_seconds=timeout_seconds,
             )
 
     except httpx.TimeoutException as exc:
@@ -225,11 +233,37 @@ def cohere_provider(messages: list[Message]) -> str:
 # provider registry
 ProviderFunction = Callable[[list[Message]], str]
 
+
+@dataclass(frozen=True)
+class BudgetedProvider:
+    invoke: Callable[[list[Message], float | None], str]
+
+    def __call__(self, messages: list[Message]) -> str:
+        return self.invoke(messages, None)
+
+    def with_budget(
+        self,
+        messages: list[Message],
+        remaining_seconds: float,
+    ) -> str:
+        return self.invoke(messages, remaining_seconds)
+
+
 PROVIDERS: dict[str, ProviderFunction] = {
     "provider-a": mock_provider_a,
     "provider-b": mock_provider_b,
-    "deepseek": deepseek_provider,
-    "cohere": cohere_provider,
+    "deepseek": BudgetedProvider(
+        lambda messages, seconds: deepseek_provider(
+            messages,
+            timeout_seconds=seconds,
+        )
+    ),
+    "cohere": BudgetedProvider(
+        lambda messages, seconds: cohere_provider(
+            messages,
+            timeout_seconds=seconds,
+        )
+    ),
 }
 
 # Model routing config
@@ -244,6 +278,7 @@ MODEL_ROUTES: dict[str, str] = {
 # No automatic real-provider fallback is enabled.
 FALLBACK_ROUTES: dict[str, tuple[str, ...]] = {
     "mock-fallback": ("provider-a", "provider-b"),
+    "mock-retry": ("provider-a", "provider-a"),
 }
 
 # Provider output boundary
@@ -260,8 +295,18 @@ def validate_provider_output(raw_output: object) -> str:
 def invoke_validated(
     provider: ProviderFunction,
     messages: list[Message],
+    remaining_seconds: float,
 ) -> str:
-    raw_output = provider(messages)
+
+    if isinstance(provider, BudgetedProvider):
+        raw_output = provider.with_budget(
+            messages,
+            remaining_seconds,
+        )
+
+    else:
+        raw_output = provider(messages)
+
     return validate_provider_output(raw_output)
 
 def can_failover(exc: Exception) -> bool:
@@ -314,9 +359,17 @@ def chat_completions(request: ChatRequest) -> ChatResponse:
     try:
         result = execute_plan(
             tuple(attempts),
-            can_failover=can_failover,
+            can_continue=can_failover,
             max_attempts=2,
+            total_timeout_seconds=20.0,
+            backoff_seconds=0.05,
         )
+
+    except DeadlineExceeded as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="Gateway execution deadline exceeded",
+        ) from exc
 
     except ProviderExecutionError as exc:
         status_code, detail = PROVIDER_FAILURE_HTTP[exc.kind]

@@ -36,7 +36,19 @@ def complete(
     api_key: str,
     *,
     client: httpx.Client,
+    timeout_seconds: float | None = None,
 ) -> str:
+
+    budget = 30.0 if timeout_seconds is None else timeout_seconds
+
+    if budget <= 0:
+        raise ValueError("Invalid HTTP timeout")
+
+    request_timeout = httpx.Timeout(
+        budget,
+        connect=min(5.0, budget),
+    )
+
     response = client.post(
         COHERE_URL,
         headers={
@@ -49,6 +61,7 @@ def complete(
             "stream": False,
             "max_tokens": 128,
         },
+        timeout=request_timeout,
     )
 
     response.raise_for_status()
